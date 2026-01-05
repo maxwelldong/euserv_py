@@ -67,7 +67,7 @@ GLOBAL_CONFIG = GlobalConfig(
     telegram_bot_token=os.getenv("TG_BOT_TOKEN"),
     telegram_chat_id=os.getenv("TG_CHAT_ID"),
     max_workers=3,  # 建议不超过5，避免触发频率限制
-    max_login_retries=3
+    max_login_retries=5
 )
 
 
@@ -227,6 +227,7 @@ class EUserv:
         self.config = config
         self.session = requests.Session()
         self.sess_id = None
+        self.c_id = None
         
     def login(self) -> bool:
         """登录 EUserv（支持验证码和 PIN）"""
@@ -271,6 +272,9 @@ class EUserv:
             response = self.session.post(url, headers=headers, data=login_data)
             response.raise_for_status()
 
+            #解析返回页面
+            soup = BeautifulSoup(response.text, "html.parser")
+
             # 检查登录错误
             if 'Please check email address/customer ID and password' in response.text:
                 logger.error("❌ 用户名或密码错误")
@@ -301,8 +305,10 @@ class EUserv:
                     logger.error("❌ 验证码错误")
                     return False
             
+
             # 处理 PIN 验证
             if 'PIN that you receive via email' in response.text:
+                self.c_id = soup.find("input", {"name": "c_id"})["value"]
                 logger.info("⚠️ 需要 PIN 验证")
                 time.sleep(3)  # 等待邮件到达
                 
@@ -316,16 +322,17 @@ class EUserv:
                     logger.error("❌ 获取 PIN 码失败")
                     return False
                 
-                soup = BeautifulSoup(response.text, "html.parser")
+                
                 login_confirm_data = {
                     'pin': pin,
                     'sess_id': sess_id,
                     'Submit': 'Confirm',
                     'subaction': 'login',
-                    'c_id': soup.find("input", {"name": "c_id"})["value"],
+                    'c_id': self.c_id,
                 }
                 response = self.session.post(url, headers=headers, data=login_confirm_data)
                 response.raise_for_status()
+
 
             # 检查登录成功
             success_checks = [
@@ -346,6 +353,129 @@ class EUserv:
             logger.error(f"❌ 登录过程出现异常: {e}", exc_info=True)
             return False
     
+
+
+    def update_info(self):
+        # 判断当前日期是否为2号或22号，一个月更新两次
+        current_day = datetime.now().day
+        if current_day not in [2, 22]:
+            return
+
+        logger.info(f"更新用户信息...")
+        try:
+            # 更新用户信息，euserv每隔一段时间就需要用户更新信息，每个月2号，22号
+            #1.进入用户界面
+            url = f"https://support.euserv.com/index.iphp?sess_id={self.sess_id}&action=show_customerdata"
+            showinfo_data = {
+                'sess_id': self.sess_id,
+                'action': 'show_customerdata'
+            }
+            headers = {'user-agent': USER_AGENT, 
+                       'host': 'support.euserv.com',
+                       'referer': 'https://support.euserv.com/index.iphp?sess_id={self.sess_id}&subaction=show_kwk_main'
+                       }
+            
+            logger.info(f"进入用户界面...")
+            response = self.session.get(url=url, headers=headers)
+            response.raise_for_status()
+
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+
+            self.c_id = soup.find("input", {"name": "c_id"})["value"]
+            c_att = soup.select_one('#c_att option[selected]').get('value')
+            c_street = soup.find('input', {'name': 'c_street'})['value']
+            c_streetno = soup.find('input', {'name': 'c_streetno'})['value']
+            c_postal = soup.find('input', {'name': 'c_postal'})['value']
+            c_city = soup.find('input', {'name': 'c_city'})['value']
+            c_country = soup.select_one('#c_country option[selected]').get('value')
+            c_phone_country_prefix = soup.find('input', {'name': 'c_phone_country_prefix'})['value']      
+            c_phone_password = soup.find('input', {'name': 'c_phone_password'})['value'] 
+            c_fax_country_prefix = soup.find('input', {'name': 'c_fax_country_prefix'})['value'] 
+            c_tac_date = soup.find('input', {'name': 'c_tac_date'})['value'] 
+            c_website = soup.find('input', {'name': 'c_website'})['value'] 
+            c_firstcontact = soup.select_one('#c_firstcontact option[selected]').get('value')
+            c_emailabo_contract = soup.find('input', {'name': 'c_emailabo_contract'})['value'] 
+            c_emailabo_products = soup.find('input', {'name': 'c_emailabo_products'})['value'] 
+            c_forumnick = soup.find('input', {'name': 'c_forumnick'})['value'] 
+            c_hrno = soup.find('input', {'name': 'c_hrno'})['value'] 
+            c_hrcourt = soup.find('input', {'name': 'c_hrcourt'})['value'] 
+            c_taxid = soup.find('input', {'name': 'c_taxid'})['value'] 
+            c_identifier = soup.find('input', {'name': 'c_identifier'})['value'] 
+            c_birthplace = soup.find('input', {'name': 'c_birthplace'})['value'] 
+            c_country_of_birth = soup.select_one('#c_country_of_birth option[selected]').get('value')
+
+            c_birthdays = soup.find_all('input', {'name': 'c_birthday[]'})
+            c_birthday_value = []
+            for c_birthday in c_birthdays:
+                if c_birthday:
+                    c_birthday_value.append(c_birthday['value'].strip())
+                else:
+                    c_birthday_value.append('')
+
+            c_phones = soup.find_all('input', {'name': 'c_phone[]'})
+            c_phone_value = []
+            for c_phone in c_phones:
+                if c_phone:
+                    c_phone_value.append(c_phone['value'].strip())
+                else:
+                    c_phone_value.append('')
+
+            c_faxs = soup.find_all('input', {'name': 'c_fax[]'})
+            c_fax_value = []
+            for c_fax in c_faxs:
+                if c_fax:
+                    c_fax_value.append(c_fax['value'].strip())
+                else:
+                    c_fax_value.append('')     
+
+            upInfo_data = {
+                'sess_id': self.sess_id,
+                'subaction': 'kc2_customer_data_update',
+                'c_id': self.c_id,
+                'c_org': '',
+                'c_ustid[]': ['', ''],
+                'c_att': c_att,
+                'c_street': c_street,
+                'c_streetno': c_streetno,
+                'c_postal': c_postal,
+                'c_city': c_city,
+                'c_country': c_country,
+                'c_birthday[]': c_birthday_value,
+                'c_phone_country_prefix': c_phone_country_prefix,
+                'c_phone[]': c_phone_value,
+                'c_phone_password': c_phone_password,
+                'c_fax_country_prefix': c_fax_country_prefix,
+                'c_fax[]': c_fax_value,
+                'c_tac_date': c_tac_date,
+                'c_website': c_website,
+                'c_firstcontact': c_firstcontact,
+                'c_emailabo_contract': c_emailabo_contract,
+                'c_emailabo_products': c_emailabo_products,
+                'c_forumnick': c_forumnick,
+                'c_hrno': c_hrno,
+                'c_hrcourt': c_hrcourt,
+                'c_taxid': c_taxid,
+                'c_identifier': c_identifier,
+                'c_birthplace': c_birthplace,
+                'c_country_of_birth': c_country_of_birth
+            }
+
+            url = f"https://support.euserv.com/index.iphp"
+            logger.info(f"提交保存用户信息...")
+            response = self.session.post(url=url, headers=headers, data=upInfo_data)
+            response.raise_for_status()
+
+            if 'customer data has been changed' in response.text:
+                logger.info(f"保存用户信息成功")
+            else:
+                logger.info(f"保存用户信息失败，接口返回response={response.text}")
+
+        except Exception as e:
+            logger.error(f"❌ 更新用户信息异常: {e}", exc_info=True)
+            return False
+
+
     def get_servers(self) -> Dict[str, Tuple[bool, str]]:
         """获取服务器列表"""
         logger.info(f"正在获取账号 {self.config.email} 的服务器列表...")
@@ -547,6 +677,9 @@ def process_account(account_config: AccountConfig, global_config: GlobalConfig) 
             result['error'] = "登录失败"
             return result
         
+        # 更新用户信息
+        euserv.update_info()
+
         # 获取服务器列表
         servers = euserv.get_servers()
         result['servers'] = servers
