@@ -26,6 +26,7 @@ import ddddocr
 import requests
 from bs4 import BeautifulSoup
 from imap_tools import MailBox, AND
+from urllib.parse import quote
 
 # 配置日志
 logging.basicConfig(
@@ -58,9 +59,10 @@ class AccountConfig:
 
 class GlobalConfig:
     """全局配置"""
-    def __init__(self, telegram_bot_token="", telegram_chat_id="", max_workers=3, max_login_retries=3):
+    def __init__(self, telegram_bot_token="", telegram_chat_id="", bark_url="", max_workers=3, max_login_retries=3):
         self.telegram_bot_token = telegram_bot_token
         self.telegram_chat_id = telegram_chat_id
+        self.bark_url = bark_url  # 新增：Bark 推送 URL
         self.max_workers = max_workers
         self.max_login_retries = max_login_retries
 
@@ -68,9 +70,10 @@ class GlobalConfig:
 # ============== 配置区 ==============
 # 全局配置
 GLOBAL_CONFIG = GlobalConfig(
-    telegram_bot_token=os.getenv("TG_BOT_TOKEN"),
-    telegram_chat_id=os.getenv("TG_CHAT_ID"),
-    max_workers=3,  # 建议不超过5，避免触发频率限制
+    telegram_bot_token=os.getenv("TG_BOT_TOKEN"), # tg的api token
+    telegram_chat_id=os.getenv("TG_CHAT_ID"), # tg的userid
+    bark_url=os.getenv("BARK_URL"),  #ios系统bark推送,基础格式：https://api.day.app/your_key/或自建服务器：https://your-bark-server.com/your_key/
+    max_workers=3,
     max_login_retries=5
 )
 
@@ -406,11 +409,11 @@ class EUserv:
             if 'captcha' in response.text.lower():
                 logger.info("⚠️ 需要验证码，正在识别...")
 
-                max_captcha_retries = 5  # 验证码最多重试5次，防止重复登录触发风控
+                max_captcha_retries = 10  # 验证码最多重试10次
                 for captcha_attempt in range(max_captcha_retries):
                     if captcha_attempt > 0:
                         logger.warning(f"验证码识别失败，第 {captcha_attempt + 1}/{max_captcha_retries} 次重试...")
-                        time.sleep(2)  # 等待一下再重试
+                        time.sleep(3)  # 等待一下再重试
 
                     # 识别验证码
                     captcha_code = recognize_and_calculate(captcha_url, self.session)
@@ -761,6 +764,55 @@ class EUserv:
             return False
 
 
+
+
+def send_bark(title: str, content: str, config: GlobalConfig):
+    """
+    发送 Bark 推送通知
+    
+    Args:
+        title: 推送标题
+        content: 推送内容
+        config: 全局配置对象
+    """
+    if not config.bark_url:
+        logger.warning("⚠️ 未配置 Bark URL，跳过 Bark 通知")
+        return
+    
+    try:
+        # 确保 URL 以 / 结尾
+        bark_url = config.bark_url.rstrip('/') + '/'
+        
+        # URL 编码标题和内容
+        encoded_title = quote(title)
+        encoded_content = quote(content)
+        
+        post_url = bark_url.rstrip('/')
+        data = {
+            "title": title,
+            "body": content,
+            "sound": "telegraph",  # 推送音效
+            "group": "EUserv",     # 分组
+            "icon": "https://www.euserv.com/favicon.ico"  # 自定义图标
+        }
+        
+        # 发送请求
+        response = requests.post(post_url, json=data, timeout=20)
+        
+        if response.status_code == 200:
+            result = response.json()
+            if result.get('code') == 200:
+                logger.info("✅ Bark 推送发送成功")
+            else:
+                logger.error(f"❌ Bark 推送失败: {result.get('message', '未知错误')}")
+        else:
+            logger.error(f"❌ Bark 推送失败: HTTP {response.status_code}")
+            
+    except Exception as e:
+        logger.error(f"❌ Bark 推送异常: {e}", exc_info=True)
+
+
+
 def send_telegram(message: str, config: GlobalConfig):
     """发送 Telegram 通知"""
     if not config.telegram_bot_token or not config.telegram_chat_id:
@@ -782,6 +834,23 @@ def send_telegram(message: str, config: GlobalConfig):
             logger.error(f"❌ Telegram 通知失败: {response.status_code}")
     except Exception as e:
         logger.error(f"❌ Telegram 异常: {e}", exc_info=True)
+
+
+def send_notification(title: str, message: str, config: GlobalConfig):
+    """
+    统一发送通知（支持 Telegram 和 Bark）
+    
+    Args:
+        title: 通知标题（主要用于 Bark）
+        message: 通知内容
+        config: 全局配置对象
+    """
+    # 发送 Telegram 通知
+    send_telegram(message, config)
+    
+    # 发送 Bark 通知（将 HTML 格式转为纯文本）
+    plain_message = re.sub(r'<[^>]+>', '', message)  # 移除 HTML 标签
+    send_bark(title, plain_message, config)
 
 
 def process_account(account_config: AccountConfig, global_config: GlobalConfig) -> Dict:
@@ -927,11 +996,13 @@ def main():
     
     # 发送 Telegram 通知
     message = "\n".join(message_parts)
-    send_telegram(message, GLOBAL_CONFIG)
+    # send_telegram(message, GLOBAL_CONFIG)
+    send_notification("EUserv 续期报告", message, GLOBAL_CONFIG)
     
     logger.info("\n" + "=" * 60)
     logger.info("执行完成")
     logger.info("=" * 60)
+    os._exit(0)
 
 
 if __name__ == "__main__":
