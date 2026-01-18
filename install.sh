@@ -369,8 +369,8 @@ auto_switch_to_direct_mode() {
     
     # 安装Python依赖
     echo "安装Python依赖库..."
-    pip3 install --quiet requests beautifulsoup4 lxml 2>/dev/null || \
-    pip3 install requests beautifulsoup4 lxml Pillow python-dotenv
+    pip3 install --quiet requests beautifulsoup4 lxml Pillow python-dotenv ddddocr imap-tools 2>/dev/null || \
+    pip3 install requests beautifulsoup4 lxml Pillow python-dotenv ddddocr imap-tools
     
     echo "✓ Python依赖安装完成"
     
