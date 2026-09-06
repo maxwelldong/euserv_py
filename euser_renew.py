@@ -6,6 +6,7 @@ EUserv 自动续期脚本 - 多账号多线程版本
 """
 
 import os
+import hashlib
 
 import sys
 import io
@@ -15,7 +16,7 @@ import time
 import threading
 import logging
 from typing import Dict, List, Tuple, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PIL import Image
@@ -41,7 +42,7 @@ if not hasattr(Image, 'ANTIALIAS'):
     Image.ANTIALIAS = Image.Resampling.LANCZOS
 
 # 全局 OCR 实例（线程安全）
-ocr = ddddocr.DdddOcr(beta=True)
+ocr = ddddocr.DdddOcr(beta=True, show_ad=False)
 ocr_lock = threading.Lock()
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36"
@@ -318,7 +319,7 @@ def recognize_and_calculate(captcha_image_url: str, session: requests.Session) -
                 return result
         
         # 策略3：激进纠正 - 强制把所有非数字转为数字，再尝试解析
-        logger.warning(f"常规解析失败，尝试激进纠正...")
+        logger.warning("常规解析失败，尝试激进纠正...")
         aggressive_text = aggressive_digit_convert(raw_text)
         logger.debug(f"激进纠正结果: {raw_text} → {aggressive_text}")
         
@@ -404,10 +405,12 @@ def calculate_operation(left: int, op: str, right: int, raw_text: str, silent: b
 
 
 def get_euserv_pin(email: str, email_password: str, imap_server: str,
-                   max_retries: int = 6, retry_interval: int = 5) -> Optional[str]:
-    """从邮箱获取 EUserv PIN 码（带轮询重试）
+                   max_retries: int = 6, retry_interval: int = 5,
+                   max_age_seconds: int = 90) -> Optional[str]:
+    """从邮箱获取 EUserv PIN 码（带轮询重试 + 时效性校验）
 
     因 PIN 邮件可能有延迟，会按 retry_interval 秒间隔最多重试 max_retries 次。
+    只接受 max_age_seconds 秒内发送的 PIN，避免拿到旧 PIN 导致续期失败。
 
     Args:
         email: 邮箱地址
@@ -415,7 +418,9 @@ def get_euserv_pin(email: str, email_password: str, imap_server: str,
         imap_server: IMAP 服务器地址
         max_retries: 最大重试次数（默认 6 次）
         retry_interval: 每轮间隔秒数（默认 5 秒）
+        max_age_seconds: 最大 PIN 邮件时效（默认 90 秒，超过则跳过等待新邮件）
     """
+    cutoff = datetime.now() - timedelta(seconds=max_age_seconds)
     for attempt in range(1, max_retries + 1):
         try:
             if attempt > 1:
@@ -426,6 +431,12 @@ def get_euserv_pin(email: str, email_password: str, imap_server: str,
             with MailBox(imap_server).login(email, email_password) as mailbox:
                 for msg in mailbox.fetch(AND(from_='no-reply@euserv.com', body='PIN'), limit=1, reverse=True):
                     logger.debug(f"找到邮件: {msg.subject}, 收件时间: {msg.date_str}")
+
+                    # ★ 时效性校验：跳过旧邮件，等新的 PIN 邮件
+                    msg_date = msg.date
+                    if msg_date and msg_date.replace(tzinfo=None) < cutoff:
+                        logger.info(f"PIN 邮件时间 {msg_date} 超过 {max_age_seconds}s，可能为旧 PIN，等待新邮件...")
+                        continue
 
                     match = re.search(r'PIN:\s*\n?(\d{6})', msg.text)
                     if match:
@@ -464,7 +475,7 @@ class EUserv:
         self.c_id = None
         # 每个账号对应一个独立的 cookie 文件
         os.makedirs(self.COOKIE_DIR, exist_ok=True)
-        safe_name = re.sub(r'[^\w@.-]', '_', config.email)
+        safe_name = hashlib.md5(config.email.encode()).hexdigest()
         self.cookie_file = os.path.join(self.COOKIE_DIR, f"{safe_name}.json")
         # 初始化时尝试加载已保存的 Cookie（让服务器识别为受信任设备，跳过 PIN）
         self._load_cookies()
@@ -508,7 +519,7 @@ class EUserv:
                         domain=c.get('domain', 'support.euserv.com'),
                         path=c.get('path', '/'),
                     )
-            logger.info(f"🍪 已加载信任设备 Cookie，登录时将跳过 PIN 验证")
+            logger.info("🍪 已加载信任设备 Cookie，登录时将跳过 PIN 验证")
         except Exception as e:
             logger.warning(f"⚠️ 加载 Cookie 失败: {e}")
 
@@ -608,12 +619,13 @@ class EUserv:
             if 'PIN that you receive via email' in response.text:
                 self.c_id = soup.find("input", {"name": "c_id"})["value"]
                 logger.info("⚠️ 需要 PIN 验证（首次登录或 Cookie 已失效）")
-                time.sleep(3)
+                time.sleep(8)  # ★ 等邮件送达
 
                 pin = get_euserv_pin(
                     self.config.email_pin,
                     self.config.email_password,
-                    self.config.imap_server
+                    self.config.imap_server,
+                    max_age_seconds=60  # ★ 只接受最近 60 秒内的 PIN
                 )
 
                 if not pin:
@@ -847,13 +859,16 @@ class EUserv:
                     if len(server_id_cells) != 1:
                         continue
                     
-                    # 修复2: 取所有 td-z1-sp2-kc，用索引 [2] 拿 Actions 列
-                    action_cells = tr.select('.td-z1-sp2-kc')
-                    if len(action_cells) < 3:
-                        continue
-                    
-                    # Actions 列是第 3 个（索引 2）
-                    action_text = action_cells[2].get_text(strip=True)
+                    # 修复: 优先查找嵌套的 action_container，不依赖列数索引
+                    action_container = tr.select_one('.td-z1-sp2-kc .kc2_order_action_container')
+                    if action_container:
+                        action_text = action_container.get_text(strip=True)
+                    else:
+                        # 兜底：取最后一个 td-z1-sp2-kc 单元格内容
+                        action_cells = tr.select('.td-z1-sp2-kc')
+                        if not action_cells:
+                            continue
+                        action_text = action_cells[-1].get_text(strip=True)
                     logger.debug(f"续期信息: {action_text}")
 
                     can_renew = True
@@ -918,17 +933,22 @@ class EUserv:
             if resp2.status_code != 200:
                 logger.error("❌ PIN发送请求失败")
                 return False
-            
-            # 步骤3: 获取 PIN（内部有轮询重试，不再硬等）
+
+            # ★ 等待 PIN 邮件送达邮箱（IMAP 延迟通常 5-15 秒）
+            logger.info("⏳ 等待 PIN 邮件送达...（15 秒）")
+            time.sleep(15)
+
+            # 步骤3: 获取 PIN（内部有轮询重试）
             logger.debug("步骤3: 获取 PIN 码...")
             pin = get_euserv_pin(
                 self.config.email_pin,
                 self.config.email_password,
-                self.config.imap_server
+                self.config.imap_server,
+                max_age_seconds=60  # ★ 只接受最近 60 秒内的 PIN
             )
             
             if not pin:
-                logger.error(f"❌ 获取续期 PIN 码失败")
+                logger.error("❌ 获取续期 PIN 码失败")
                 return False
         
             # 步骤4: 验证 PIN 获取 token
@@ -1259,7 +1279,7 @@ def main():
                 if can_renew_date:
                     logger.info(f"    订单 {order_id}: 可续期日期 {can_renew_date}")
 
-    # 只有存在需要通知的事件时才发送
+    # 发送通知（同步调用，确保发送完成再退出）
     if notify_parts:
         header = f"<b>🔄 EUserv 续期通知</b>\n时间: {time_str}\n"
         message = header + "\n\n".join(notify_parts)
@@ -1270,7 +1290,7 @@ def main():
     logger.info("\n" + "=" * 60)
     logger.info("执行完成")
     logger.info("=" * 60)
-    os._exit(0)
+    sys.exit(0)
 
 
 if __name__ == "__main__":

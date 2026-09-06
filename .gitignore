@@ -3,3 +3,6 @@
 *Test.py
 *.png
 cookies/
+__pycache__/
+*.pyc
+.DS_Store
